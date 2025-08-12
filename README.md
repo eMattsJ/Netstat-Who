@@ -169,12 +169,6 @@ Please keep changes self‑contained (it’s meant to be single‑file/portable)
 
 ---
 
-## License
-
-MIT — see [LICENSE](LICENSE).
-
----
-
 ## Acknowledgments
 
 * RDAP courtesy of the RIR ecosystem via **rdap.org** (routes to ARIN/RIPE/APNIC/LACNIC/AFRINIC)
