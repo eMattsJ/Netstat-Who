@@ -1,8 +1,8 @@
-# Netstat-Who.ps1 (v1.4.0)
-# Fixes: proper Point/Size constructors; no inline "if" assignments; UI layout tidied; PS 5.1-safe.
-# Features: dark theme default + toggle, CSV export, sort, search, process quick filter,
-# expand/collapse all details, port research links, parallel RDAP with cache,
-# Owner/Net columns, and a selectable "Show full process path" option.
+# Netstat-Who.ps1 (v1.5)
+# Additions: (1) metadata (parent/cmdline/signer/SHA256), (2) baseline “NEW” detection,
+# (3) suspicion score + filter. Also includes "Show full process path" option.
+# Kept: dark theme default + toggle, CSV export, sort, search, process filter,
+# expand/collapse details, port research links, parallel RDAP with cache.
 
 [CmdletBinding()]
 param()
@@ -17,7 +17,7 @@ function New-Size ([int]$w,[int]$h) { New-Object System.Drawing.Size  -ArgumentL
 $form               = New-Object System.Windows.Forms.Form
 $form.Text          = "Netstat-Who Options"
 $form.StartPosition = "CenterScreen"
-$form.Size          = New-Size 620 500
+$form.Size          = New-Size 720 520
 $form.Topmost       = $true
 
 $y = 15
@@ -40,7 +40,7 @@ $form.Controls.Add($lblLocalCIDR)
 
 $txtLocalCIDR              = New-Object System.Windows.Forms.TextBox
 $txtLocalCIDR.Location     = New-Point 18 ($y + 25)
-$txtLocalCIDR.Size         = New-Size 565 22
+$txtLocalCIDR.Size         = New-Size 665 22
 $txtLocalCIDR.Text         = ""   # e.g. 192.168.2.0/23
 $form.Controls.Add($txtLocalCIDR)
 
@@ -53,8 +53,13 @@ $chkResolveDNS    = Add-Check "Resolve reverse DNS for remote IPs" $false
 $chkDoRDAP        = Add-Check "Do RDAP owner lookups for remote IPs" $true
 $chkUseCache      = Add-Check "Use RDAP cache (faster repeat runs)" $true
 $chkClearCache    = Add-Check "Clear RDAP cache now" $false
-$chkShowProcPath  = Add-Check "Show full process path" $false
 
+$y += 10
+$chkMeta          = Add-Check "Enrich process metadata (parent, command line, signer/company)" $true
+$chkHashes        = Add-Check "Compute SHA256 for process image (slower)" $false
+$chkShowPath      = Add-Check "Show full process path in Process column" $false
+
+$y += 5
 $lblHtml              = New-Object System.Windows.Forms.Label
 $lblHtml.Text         = "Export HTML report:"
 $lblHtml.Location     = New-Point 15 $y
@@ -63,14 +68,14 @@ $form.Controls.Add($lblHtml)
 
 $txtHtml              = New-Object System.Windows.Forms.TextBox
 $txtHtml.Location     = New-Point 18 ($y + 20)
-$txtHtml.Size         = New-Size 470 22
+$txtHtml.Size         = New-Size 560 22
 $txtHtml.Text         = ""
 $form.Controls.Add($txtHtml)
 
 $btnBrowseHtml              = New-Object System.Windows.Forms.Button
 $btnBrowseHtml.Text         = "Browse…"
-$btnBrowseHtml.Location     = New-Point 495 ($y + 18)
-$btnBrowseHtml.Size         = New-Size 88 26
+$btnBrowseHtml.Location     = New-Point 585 ($y + 18)
+$btnBrowseHtml.Size         = New-Size 98 26
 $btnBrowseHtml.Add_Click({
   $sfd = New-Object System.Windows.Forms.SaveFileDialog
   $sfd.Filter = "HTML files (*.html)|*.html|All files (*.*)|*.*"
@@ -87,14 +92,14 @@ $chkOpenWhenDone = Add-Check "Open report when done" $true
 $btnOK                = New-Object System.Windows.Forms.Button
 $btnOK.Text           = "OK"
 $btnOK.Size           = New-Size 120 30
-$btnOK.Location       = New-Point 330 410
+$btnOK.Location       = New-Point 450 425
 $btnOK.DialogResult   = [System.Windows.Forms.DialogResult]::OK
 $form.Controls.Add($btnOK)
 
 $btnCancel            = New-Object System.Windows.Forms.Button
 $btnCancel.Text       = "Cancel"
 $btnCancel.Size       = New-Size 120 30
-$btnCancel.Location   = New-Point 465 410
+$btnCancel.Location   = New-Point 585 425
 $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 $form.Controls.Add($btnCancel)
 
@@ -112,8 +117,10 @@ $ResolveDNS         = $chkResolveDNS.Checked
 $DoRDAP             = $chkDoRDAP.Checked
 $UseCache           = $chkUseCache.Checked
 $ClearCache         = $chkClearCache.Checked
-$ShowProcPath       = $chkShowProcPath.Checked
 $OpenWhenDone       = $chkOpenWhenDone.Checked
+$EnrichMeta         = $chkMeta.Checked
+$DoHashes           = $chkHashes.Checked
+$ShowProcessPath    = $chkShowPath.Checked
 
 $ReportPath = if ($txtHtml.Text) { $txtHtml.Text } else { Join-Path $env:USERPROFILE "Desktop\netstat_who_report.html" }
 $LocalCIDR  = @()
@@ -206,7 +213,8 @@ function ShouldExcludeIP {
   return $false
 }
 
-# ---------- Port name lookup (services file + friendly overrides) ----------
+# ---------- Port name lookup (via services file + overrides) ----------
+
 $PortOverrides = @{
   "20/tcp"="ftp-data"; "21/tcp"="ftp"; "22/tcp"="ssh"; "23/tcp"="telnet"; "25/tcp"="smtp"
   "53/tcp"="dns"; "53/udp"="dns"
@@ -231,7 +239,6 @@ function Get-ServicesIndex {
   $idx = @{}
   $svcPath = Join-Path $env:SystemRoot "System32\drivers\etc\services"
   if (-not (Test-Path $svcPath)) { $script:ServicesIndex = @{}; return $script:ServicesIndex }
-
   $lines = Get-Content -LiteralPath $svcPath -Encoding ascii
   foreach ($line in $lines) {
     if ($line -match '^\s*#') { continue }
@@ -240,14 +247,10 @@ function Get-ServicesIndex {
       $port  = [int]$matches[2]
       $proto = $matches[3].ToLower()
       $aliases = @()
-      if ($matches[4]) {
-        $aliases = ($matches[4] -split '\s+') | Where-Object { $_ -and $_ -notmatch '^\s*$' }
-      }
+      if ($matches[4]) { $aliases = ($matches[4] -split '\s+') | Where-Object { $_ -and $_ -notmatch '^\s*$' } }
       if (-not $idx.ContainsKey($port)) { $idx[$port] = @{ tcp = @(); udp = @() } }
       if ($idx[$port][$proto] -notcontains $name)   { $idx[$port][$proto] += $name }
-      foreach ($a in $aliases) {
-        if ($a -and $idx[$port][$proto] -notcontains $a) { $idx[$port][$proto] += $a }
-      }
+      foreach ($a in $aliases) { if ($a -and $idx[$port][$proto] -notcontains $a) { $idx[$port][$proto] += $a } }
     }
   }
   $script:ServicesIndex = $idx
@@ -255,23 +258,18 @@ function Get-ServicesIndex {
 }
 
 function Get-PortName {
-  param(
-    [Parameter(Mandatory)] [int]$Port,
-    [ValidateSet('tcp','udp')] [string]$Protocol = 'tcp'
-  )
+  param([Parameter(Mandatory)] [int]$Port, [ValidateSet('tcp','udp')] [string]$Protocol = 'tcp')
   $keyProto = "$Port/$Protocol"
   if ($PortOverrides.ContainsKey($keyProto)) { return $PortOverrides[$keyProto] }
   if ($PortOverrides.ContainsKey("$Port"))   { return $PortOverrides["$Port"] }
-
   $idx = Get-ServicesIndex
   if ($idx.ContainsKey($Port)) {
     $names = $idx[$Port][$Protocol]
     if ($names -and $names.Count -gt 0) { return $names[0] }
-    $other = @{ 'tcp'='udp'; 'udp'='tcp' }[$Protocol]
+    $other = @{'tcp'='udp'; 'udp'='tcp'}[$Protocol]
     $namesOther = $idx[$Port][$other]
     if ($namesOther -and $namesOther.Count -gt 0) { return $namesOther[0] }
   }
-
   if     ($Port -le 1023)  { return "well-known" }
   elseif ($Port -le 49151) { return "registered" }
   else                     { return "dynamic/private" }
@@ -294,10 +292,7 @@ $CacheDir  = Join-Path $env:LOCALAPPDATA "NetstatWho"
 $CacheFile = Join-Path $CacheDir "rdap_cache.json"
 $RdapCache = @{}
 
-if ($ClearCache -and (Test-Path $CacheFile)) {
-  Remove-Item $CacheFile -Force -ErrorAction SilentlyContinue
-}
-
+if ($ClearCache -and (Test-Path $CacheFile)) { Remove-Item $CacheFile -Force -ErrorAction SilentlyContinue }
 if ($UseCache -and (Test-Path $CacheFile)) {
   try {
     $json = Get-Content -LiteralPath $CacheFile -Raw -ErrorAction Stop
@@ -319,46 +314,76 @@ $script:LocalSubnets = Get-LocalSubnets
 $rows = @()
 $remoteIps = [System.Collections.Generic.HashSet[string]]::new()
 
-# Gather connections
 $allTCP  = Get-NetTCPConnection -ErrorAction SilentlyContinue
 $allUDP  = Get-NetUDPEndpoint   -ErrorAction SilentlyContinue
 
-# Build PID -> @{ Name; Path }
+# Build PID -> Name map
 $pids = @($allTCP.OwningProcess + $allUDP.OwningProcess) | Where-Object { $_ } | Sort-Object -Unique
-$procMap = @{}
-try {
-  if ($pids.Count -gt 0) {
-    $filter = ($pids | ForEach-Object { "ProcessId=$_" }) -join ' OR '
-    $procs = Get-CimInstance Win32_Process -Filter $filter -ErrorAction Stop
-    foreach ($p in $procs) {
-      $procMap[[int]$p.ProcessId] = @{ Name = $p.Name; Path = $p.ExecutablePath }
-    }
-  }
-} catch {
+$pidName = @{}
+foreach ($procId in $pids) {
+  try { $pidName[$procId] = (Get-Process -Id $procId -ErrorAction SilentlyContinue).Name } catch {}
+}
+
+# Metadata (also needed if "Show full path" is on)
+if ($ShowProcessPath -and -not $EnrichMeta) { $EnrichMeta = $true }
+
+$procMeta = @{}
+if ($EnrichMeta) {
+  $allWin32 = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+  $byPid = @{}
+  foreach ($p in $allWin32) { $byPid[$p.ProcessId] = $p }
+
   foreach ($procId in $pids) {
-    try {
-      $gp = Get-Process -Id $procId -ErrorAction Stop
-      $path = $null; try { $path = $gp.Path } catch {}
-      $procMap[$procId] = @{ Name = $gp.ProcessName; Path = $path }
-    } catch {}
+    $meta = @{
+      ParentPID   = $null; CmdLine = $null; Path = $null
+      Signer      = $null; SignerStatus = $null; Company = $null; SHA256 = $null
+    }
+    if ($byPid.ContainsKey($procId)) {
+      $w = $byPid[$procId]
+      $meta.ParentPID = $w.ParentProcessId
+      $meta.CmdLine   = $w.CommandLine
+      $meta.Path      = $w.ExecutablePath
+      if ($meta.Path) {
+        try {
+          $sig = Get-AuthenticodeSignature -FilePath $meta.Path -ErrorAction SilentlyContinue
+          if ($sig) { $meta.Signer = $sig.SignerCertificate.Subject; $meta.SignerStatus = $sig.Status }
+        } catch {}
+        try {
+          $fi = Get-Item -LiteralPath $meta.Path -ErrorAction SilentlyContinue
+          if ($fi -and $fi.VersionInfo) { $meta.Company = $fi.VersionInfo.CompanyName }
+        } catch {}
+        if ($DoHashes) {
+          try { $meta.SHA256 = (Get-FileHash -LiteralPath $meta.Path -Algorithm SHA256 -EA SilentlyContinue).Hash } catch {}
+        }
+      }
+    }
+    $procMeta[$procId] = $meta
   }
 }
 
-# Listening rows
+# PID -> display text (name or path)
+$pidDisplay = @{}
+foreach ($procId in $pids) {
+  $disp = $pidName[$procId]
+  if ($ShowProcessPath -and $procMeta.ContainsKey($procId)) {
+    $p = $procMeta[$procId].Path
+    if ($p) { $disp = $p }
+  }
+  $pidDisplay[$procId] = $disp
+}
+
 if ($ShowListening) {
   $rows += ($allTCP | Where-Object { $_.State -eq 'Listen' } | ForEach-Object {
-    $pname = $null; if ($procMap.ContainsKey($_.OwningProcess)) { $pname = $procMap[$_.OwningProcess].Name }
     [pscustomobject]@{
-      Protocol="TCP"; State="LISTEN"; Process=$pname; PID=$_.OwningProcess
+      Protocol="TCP"; State="LISTEN"; Process=$pidDisplay[$_.OwningProcess]; PID=$_.OwningProcess
       Local="$($_.LocalAddress):$($_.LocalPort)"; Remote=""; RemoteIP=$null
       LocalPort=$_.LocalPort; RemotePort=$null
       RemoteHost=$null; RemoteOwner=$null; RemoteNet=$null; RemoteCIDR=$null; RemoteCountry=$null
     }
   })
   $rows += ($allUDP | ForEach-Object {
-    $pname = $null; if ($procMap.ContainsKey($_.OwningProcess)) { $pname = $procMap[$_.OwningProcess].Name }
     [pscustomobject]@{
-      Protocol="UDP"; State="LISTEN"; Process=$pname; PID=$_.OwningProcess
+      Protocol="UDP"; State="LISTEN"; Process=$pidDisplay[$_.OwningProcess]; PID=$_.OwningProcess
       Local="$($_.LocalAddress):$($_.LocalPort)"; Remote=""; RemoteIP=$null
       LocalPort=$_.LocalPort; RemotePort=$null
       RemoteHost=$null; RemoteOwner=$null; RemoteNet=$null; RemoteCIDR=$null; RemoteCountry=$null
@@ -366,16 +391,14 @@ if ($ShowListening) {
   })
 }
 
-# Established rows
 if ($IncludeEstablished) {
   $rows += ($allTCP | Where-Object { $_.State -eq 'Established' } | ForEach-Object {
     $rip = $_.RemoteAddress
     if (ShouldExcludeIP -IP $rip -IncludeLocalFlag:$IncludeLocal) { return }
     $remoteEP = "${rip}:$($_.RemotePort)"
     [void]$remoteIps.Add($rip)
-    $pname = $null; if ($procMap.ContainsKey($_.OwningProcess)) { $pname = $procMap[$_.OwningProcess].Name }
     [pscustomobject]@{
-      Protocol="TCP"; State="ESTABLISHED"; Process=$pname; PID=$_.OwningProcess
+      Protocol="TCP"; State="ESTABLISHED"; Process=$pidDisplay[$_.OwningProcess]; PID=$_.OwningProcess
       Local="$($_.LocalAddress):$($_.LocalPort)"; Remote=$remoteEP; RemoteIP=$rip
       LocalPort=$_.LocalPort; RemotePort=$_.RemotePort
       RemoteHost=$null; RemoteOwner=$null; RemoteNet=$null; RemoteCIDR=$null; RemoteCountry=$null
@@ -383,9 +406,8 @@ if ($IncludeEstablished) {
   })
 }
 
-# RDAP (parallel) for public IPs
+# RDAP lookups (parallel) for public IPs only
 $rdapResults = @{}
-$rdapCacheOutChanged = $false
 if ($DoRDAP) {
   $ips = @()
   foreach ($ip in $remoteIps) {
@@ -413,7 +435,7 @@ if ($DoRDAP) {
             foreach ($e in $rdap.entities) {
               if ($e.vcardArray -and $e.vcardArray.Count -ge 2) {
                 foreach ($entry in $e.vcardArray[1]) {
-                  if ($entry[0] -eq "fn"  -and $entry[3]) { $org = $entry[3]; break }
+                  if ($entry[0] -eq "fn" -and $entry[3]) { $org = $entry[3]; break }
                   if ($entry[0] -eq "org" -and $entry[3]) { $org = ($entry[3] -join " "); break }
                 }
               }
@@ -434,7 +456,7 @@ if ($DoRDAP) {
         }
       }).AddArgument($ip)
       $ps.RunspacePool = $pool
-      $jobs += [pscustomobject]@{ PS=$ps; Handle=$ps.BeginInvoke(); IP=$ip }
+      $jobs += [pscustomobject]@{ PS=$ps; Handle=$ps.BeginInvoke() ; IP=$ip }
     }
     foreach ($j in $jobs) {
       try {
@@ -442,12 +464,12 @@ if ($DoRDAP) {
         if ($out) {
           $obj = $out[0]
           $rdapResults[$j.IP] = $obj
-          if ($UseCache) { $RdapCache[$j.IP] = $obj; $rdapCacheOutChanged = $true }
+          if ($UseCache) { $RdapCache[$j.IP] = $obj }
         }
       } catch {
         $obj = [pscustomobject]@{ IP=$j.IP; Org="(lookup failed)"; Network=""; Country=""; ASN=""; CIDR="" }
         $rdapResults[$j.IP] = $obj
-        if ($UseCache) { $RdapCache[$j.IP] = $obj; $rdapCacheOutChanged = $true }
+        if ($UseCache) { $RdapCache[$j.IP] = $obj }
       } finally { $j.PS.Dispose() }
     }
     $pool.Close(); $pool.Dispose()
@@ -464,13 +486,11 @@ if ($ResolveDNS) {
   }
 }
 
-# Final dataset enriched
-$result = $rows | Sort-Object Protocol, State, Process, Local | ForEach-Object {
-  $ip  = $_.RemoteIP
-  $rd  = $null
-  if ($ip -and $rdapResults.ContainsKey($ip)) { $rd = $rdapResults[$ip] }
-  $ptr = $null
-  if ($ip -and $ptrCache.ContainsKey($ip)) { $ptr = $ptrCache[$ip] }
+# Base result set (enrich with RDAP/rDNS)
+$resultCore = $rows | Sort-Object Protocol, State, Process, Local | ForEach-Object {
+  $ip = $_.RemoteIP
+  $rd = if ($ip -and $rdapResults.ContainsKey($ip)) { $rdapResults[$ip] } else { $null }
+  $ptr = if ($ip -and $ptrCache.ContainsKey($ip)) { $ptrCache[$ip] } else { $null }
 
   [pscustomobject]@{
     Protocol      = $_.Protocol
@@ -490,55 +510,122 @@ $result = $rows | Sort-Object Protocol, State, Process, Local | ForEach-Object {
   }
 }
 
-### ---------- Build Process Filter options (name vs path, based on toggle) ----------
-$procFilterSet = New-Object 'System.Collections.Generic.HashSet[string]'
-foreach ($r in $result) {
-  $disp = $r.Process
-  if ($ShowProcPath -and $procMap.ContainsKey([int]$r.PID)) {
-    $pp = $procMap[[int]$r.PID].Path
-    if ($pp) { $disp = $pp }
-  }
-  if ($disp) { [void]$procFilterSet.Add($disp) }
+### ---------- Baseline "NEW" ----------
+$BaselineDir  = Join-Path $env:LOCALAPPDATA "NetstatWho"
+$BaselineFile = Join-Path $BaselineDir "baseline.json"
+$baseline = @{}
+if (Test-Path $BaselineFile) {
+  try {
+    $tmp = ConvertFrom-Json (Get-Content -Raw -LiteralPath $BaselineFile)
+    foreach ($e in $tmp) {
+      $k = "$($e.Process)|$($e.RemoteIP)"
+      if (-not [string]::IsNullOrWhiteSpace($k)) { $baseline[$k] = $true }
+    }
+  } catch {}
 }
 
+$isNewSet = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($r in $resultCore) {
+  if ($r.RemoteIP) {
+    $key = "$($r.Process)|$($r.RemoteIP)"
+    if (-not $baseline.ContainsKey($key)) { [void]$isNewSet.Add($key) }
+  }
+}
+
+# Save updated baseline (after computing isNew for this run)
+try {
+  if (-not (Test-Path $BaselineDir)) { New-Item -ItemType Directory -Force -Path $BaselineDir | Out-Null }
+  $resultCore |
+    Where-Object { $_.RemoteIP } |
+    Select-Object Process, RemoteIP, RemoteOwner, RemoteNet |
+    ConvertTo-Json -Depth 4 | Out-File -Encoding utf8 -FilePath $BaselineFile
+} catch {}
+
+### ---------- Suspicion score ----------
+function Get-SuspicionScore {
+  param($row, $meta, [bool]$isNew)
+  $s = 0
+  if ($row.RemoteIP) {
+    if ([string]::IsNullOrWhiteSpace($row.RemoteHost) -and [string]::IsNullOrWhiteSpace($row.RemoteOwner)) { $s += 2 }
+    if ($row.RemotePort -gt 49151) { $s += 1 }
+  }
+  if ($meta) {
+    $st = $meta.SignerStatus
+    if (-not $st -or $st.ToString() -ne 'Valid') { $s += 2 }
+  }
+  if ($isNew) { $s += 1 }
+  return $s
+}
+
+# Build final dataset with IsNew + Score
+$result = @()
+foreach ($r in $resultCore) {
+  $key = if ($r.RemoteIP) { "$($r.Process)|$($r.RemoteIP)" } else { "" }
+  $isNew = $false
+  if ($key -and $isNewSet.Contains($key)) { $isNew = $true }
+  $m = $null
+  if ($EnrichMeta -and $r.PID -and $procMeta.ContainsKey($r.PID)) { $m = $procMeta[$r.PID] }
+  $score = Get-SuspicionScore -row $r -meta $m -isNew:$isNew
+
+  # Clone with extra fields
+  $result += [pscustomobject]@{
+    Protocol      = $r.Protocol
+    State         = $r.State
+    Process       = $r.Process
+    PID           = $r.PID
+    Local         = $r.Local
+    Remote        = $r.Remote
+    RemoteIP      = $r.RemoteIP
+    LocalPort     = $r.LocalPort
+    RemotePort    = $r.RemotePort
+    RemoteHost    = $r.RemoteHost
+    RemoteOwner   = $r.RemoteOwner
+    RemoteNet     = $r.RemoteNet
+    RemoteCIDR    = $r.RemoteCIDR
+    RemoteCountry = $r.RemoteCountry
+    IsNew         = $isNew
+    Score         = $score
+  }
+}
+
+### ---------- Build Process Filter options ----------
+$procNames = $result | ForEach-Object { $_.Process } | Where-Object { $_ } | Sort-Object -Unique
 $procOptions = New-Object System.Text.StringBuilder
 [void]$procOptions.AppendLine("<option value='ALL'>All processes</option>")
-
-# HashSet is enumerable; no ToArray() needed
-$procList = $procFilterSet | Sort-Object
-foreach ($p in $procList) {
+foreach ($p in $procNames) {
   $enc = Encode-Html $p
   [void]$procOptions.AppendLine("<option value='$enc'>$enc</option>")
 }
 
-### ---------- HTML/JS (dark default + theme toggle etc.) ----------
+### ---------- HTML (dark default + theme toggle, NEW/score filters) ----------
 $style = @"
 <style>
-:root { color-scheme: dark light; --bg:#0f1115; --fg:#e6e6e6; --muted:#9aa0a6; --border:#2a2f39; --row:#151924; --th:#161b26; --btn-bg:#1b2230; --btn-border:#2a2f39; --link:#8ab4f8; }
-body.light { --bg:#ffffff; --fg:#111; --muted:#555; --border:#e6e6e6; --row:#fafafa; --th:#f3f3f3; --btn-bg:#f6f6f6; --btn-border:#ccc; --link:#1a73e8; }
-body { background:var(--bg); color:var(--fg); font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
-h1 { font-size: 22px; margin: 0 0 6px 0; }
-.sub { color: var(--muted); margin-bottom: 16px; }
-.controls { margin: 10px 0 16px 0; display: flex; gap: 8px; flex-wrap: wrap; align-items:center; }
-input, select { padding: 6px 8px; border: 1px solid var(--btn-border); border-radius: 6px; background: var(--bg); color: var(--fg); }
-#filter { width: 280px; }
-button { padding: 6px 10px; border: 1px solid var(--btn-border); border-radius: 6px; background: var(--btn-bg); color: var(--fg); cursor:pointer; }
-a { color: var(--link); }
-table { border-collapse: collapse; width: 100%; }
-th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
-th { text-align: left; background: var(--th); position: sticky; top: 0; z-index: 1; cursor: pointer; user-select: none; }
-tr:hover { background: var(--row); }
+:root { color-scheme: dark light; --bg:#0f1115; --fg:#e6e6e6; --muted:#9aa0a6; --border:#2a2f39; --row:#151924; --th:#161b26; --btn-bg:#1b2230; --btn-border:#2a2f39; --link:#8ab4f8; --new:#8b3a3a; --scorehi:#41381f; }
+body.light { --bg:#ffffff; --fg:#111; --muted:#555; --border:#e6e6e6; --row:#fafafa; --th:#f3f3f3; --btn-bg:#f6f6f6; --btn-border:#ccc; --link:#1a73e8; --new:#ffd6d6; --scorehi:#fff6cc; }
+body { background:var(--bg); color:var(--fg); font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:24px; }
+h1 { font-size:22px; margin:0 0 6px 0; }
+.sub { color:var(--muted); margin-bottom:16px; }
+.controls { margin:10px 0 16px 0; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+input, select { padding:6px 8px; border:1px solid var(--btn-border); border-radius:6px; background:var(--bg); color:var(--fg); }
+#filter { width:280px; }
+button { padding:6px 10px; border:1px solid var(--btn-border); border-radius:6px; background:var(--btn-bg); color:var(--fg); cursor:pointer; }
+a { color:var(--link); }
+table { border-collapse:collapse; width:100%; }
+th, td { padding:8px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+th { text-align:left; background:var(--th); position:sticky; top:0; z-index:1; cursor:pointer; user-select:none; }
+tr:hover { background:var(--row); }
 .badge { display:inline-block; padding:2px 6px; border-radius:6px; font-size:12px; background:#39465e; color:#dfe7ff; }
 body.light .badge { background:#eef; color:#334; }
-.details { font-size: 12px; color: var(--fg); }
+.badge-new { background:var(--new); color:#fff; }
+.details { font-size:12px; color:var(--fg); }
 .details summary { cursor:pointer; }
-.links a { margin-right: 10px; }
+.links a { margin-right:10px; }
 .small { color:var(--muted); font-size:12px; }
 footer { color:var(--muted); font-size:12px; margin-top:18px; }
-.sort-ind { font-size: 11px; opacity: .7; }
-.theme-note { color: var(--muted); font-size: 12px; margin-left: 6px; }
-label { color: var(--muted); font-size: 12px; }
-code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+.sort-ind { font-size:11px; opacity:.7; }
+.theme-note { color:var(--muted); font-size:12px; margin-left:6px; }
+label { color:var(--muted); font-size:12px; }
+tr.score-hi { background: var(--scorehi); }
 </style>
 "@
 
@@ -561,13 +648,19 @@ function toggleTheme(){
 function applyFilters() {
   const q = document.getElementById('filter').value.toLowerCase();
   const sel = document.getElementById('procFilter').value;
+  const onlyNew = document.getElementById('onlyNew').checked;
+  const minScore = parseInt(document.getElementById('minScore').value)||0;
   const rows = document.querySelectorAll('#data tbody tr');
   rows.forEach(r => {
     const txt = r.innerText.toLowerCase();
-    const proc = (r.children[2] && r.children[2].innerText.trim()) || '';
+    const proc = r.children[2]?.innerText.trim() || '';
+    const isNew = r.getAttribute('data-new') === '1';
+    const score = parseInt(r.getAttribute('data-score'))||0;
     let ok = true;
     if (q) ok = txt.indexOf(q) >= 0;
     if (ok && sel !== 'ALL') ok = (proc === sel);
+    if (ok && onlyNew) ok = isNew;
+    if (ok && score < minScore) ok = false;
     r.style.display = ok ? '' : 'none';
   });
 }
@@ -584,7 +677,7 @@ function sortTable(idx) {
   const tb = document.querySelector('#data tbody');
   const rows = [...tb.querySelectorAll('tr')];
   if (sortState.idx === idx) { sortState.dir = -sortState.dir; } else { sortState.idx = idx; sortState.dir = 1; }
-  const numCols = new Set([3]); // PID numeric
+  const numCols = new Set([3,8]); // PID, Score numeric
   const cmp = (a,b) => {
     const ta = a.children[idx].innerText.trim();
     const tbv = b.children[idx].innerText.trim();
@@ -601,7 +694,17 @@ function collapseAllDetails(){ document.querySelectorAll('#data details').forEac
 </script>
 "@
 
-# Build table rows (process column respects toggle) + details
+# Build the summary line safely (avoid inline if in here-strings)
+$flags = @()
+if ($IncludeEstablished) { $flags += "Established" } else { $flags += "(no Established)" }
+if ($ShowListening)      { $flags += "+ Listening" }
+if ($IncludeLocal)       { $flags += "+ Local/LAN" } else { $flags += "+ Public only" }
+if ($ResolveDNS)         { $flags += "+ rDNS" }
+if ($DoRDAP)             { $flags += "+ RDAP" } else { $flags += "+ (RDAP off)" }
+if ($EnrichMeta)         { $flags += "+ Meta" }
+$summaryFlags = ($flags -join " ")
+
+# Build table rows + details (RDAP + metadata)
 $rowsHtml = New-Object System.Text.StringBuilder
 foreach ($r in $result) {
   $ip = $r.RemoteIP
@@ -629,19 +732,15 @@ foreach ($r in $result) {
     ) -join ""
   }
 
-  # Ports block
-  $lp = 0; if ($r.LocalPort)  { $lp = [int]$r.LocalPort }
-  $rp = 0; if ($r.RemotePort) { $rp = [int]$r.RemotePort }
-
+  $lp = [int]$r.LocalPort
+  $rp = [int]$r.RemotePort
   $proto = 'tcp'
   if ($r.Protocol) { try { $proto = $r.Protocol.ToString().ToLower() } catch {} }
 
-  $lpName = $null
-  if ($lp -gt 0) { $lpName = Get-PortName -Port $lp -Protocol $proto }
-  $rpName = $null
-  if ($rp -gt 0) { $rpName = Get-PortName -Port $rp -Protocol $proto }
-  $lpLinks = ""; if ($lp -gt 0) { $lpLinks = Get-PortLinksHtml -Port $lp }
-  $rpLinks = ""; if ($rp -gt 0) { $rpLinks = Get-PortLinksHtml -Port $rp }
+  $lpName  = if ($lp) { Get-PortName -Port $lp -Protocol $proto } else { $null }
+  $rpName  = if ($rp) { Get-PortName -Port $rp -Protocol $proto } else { $null }
+  $lpLinks = if ($lp -gt 0) { Get-PortLinksHtml -Port $lp } else { "" }
+  $rpLinks = if ($rp -gt 0) { Get-PortLinksHtml -Port $rp } else { "" }
 
   $portParts = @()
   if ($lp -gt 0) {
@@ -655,70 +754,60 @@ foreach ($r in $result) {
   $portsHtml = ""
   if ($portParts.Count -gt 0) { $portsHtml = "<div class='small'><strong>Ports:</strong> " + ($portParts -join " &nbsp;/&nbsp; ") + "</div>" }
 
-  # Owner/Net as columns
-  $ownerText = $r.RemoteOwner
-  $netText   = $r.RemoteNet
-
-  # Details (CIDR/Country/rDNS/ports/links)
+  # RDAP/rDNS info
   $cidrHtml    = "<div class='small'><strong>CIDR:</strong> $($r.RemoteCIDR)</div>"
   $countryHtml = "<div class='small'><strong>Country:</strong> $($r.RemoteCountry)</div>"
-  $rdnsHtml    = ""; if ($r.RemoteHost) { $rdnsHtml = "<div class='small'><strong>Reverse DNS:</strong> $($r.RemoteHost)</div>" }
+  $rdnsHtml    = if ($r.RemoteHost) { "<div class='small'><strong>Reverse DNS:</strong> $(Encode-Html $r.RemoteHost)</div>" } else { "" }
 
-  $detailBlock = ""
-  if ($ip) {
-    $detailBlock = "<details class='details'><summary>$ip</summary>$cidrHtml$countryHtml$rdnsHtml$portsHtml$linksHtml</details>"
-  }
-
-  # Process display (name vs path) + tooltip with the alternate
-  $procCell = ""
-  $disp = $r.Process
-  $tooltip = ""
-  if ($procMap.ContainsKey([int]$r.PID)) {
-    $pinfo = $procMap[[int]$r.PID]
-    $pname = $pinfo.Name
-    $ppath = $pinfo.Path
-    if ($ShowProcPath -and $ppath) {
-      $disp = $ppath
-      if ($pname) { $tooltip = $pname }
-    } else {
-      $disp = $pname
-      if ($ppath) { $tooltip = $ppath }
+  # Metadata block (optional)
+  $metaHtml = ""
+  if ($EnrichMeta -and $r.PID -and $procMeta.ContainsKey($r.PID)) {
+    $m = $procMeta[$r.PID]
+    $shaLine = ""
+    if ($m.SHA256) {
+      $shaEnc = $m.SHA256
+      $shaLine = "<div class='small'><strong>SHA256:</strong> $shaEnc &middot; <a target='_blank' rel='noopener' href='https://www.virustotal.com/gui/file/$shaEnc'>VirusTotal</a></div>"
     }
+    $metaHtml = @"
+<div class='small'><strong>Parent PID:</strong> $($m.ParentPID)</div>
+<div class='small'><strong>CmdLine:</strong> $(Encode-Html $m.CmdLine)</div>
+<div class='small'><strong>Image:</strong> $(Encode-Html $m.Path)</div>
+<div class='small'><strong>Company:</strong> $(Encode-Html $m.Company)</div>
+<div class='small'><strong>Signer:</strong> $(Encode-Html $m.Signer) ($($m.SignerStatus))</div>
+$shaLine
+"@
   }
-  if (-not $disp) { $disp = $r.Process }
-  if ($tooltip) {
-    $procCell = "<td title='$(Encode-Html $tooltip)'><code>$(Encode-Html $disp)</code></td>"
-  } else {
-    $procCell = "<td><code>$(Encode-Html $disp)</code></td>"
-  }
+
+  $detailInner = $cidrHtml + $countryHtml + $rdnsHtml + $portsHtml + $linksHtml + $metaHtml
+  $detailBlock = if ($ip) { "<details class='details'><summary>$ip</summary>$detailInner</details>" } else { "" }
+
+  $stateBadge = "<span class='badge'>$($r.State)</span>"
+  $newBadge = ""
+  if ($r.IsNew) { $newBadge = "<span class='badge badge-new'>NEW</span> " }
+
+  $rowClass = ""
+  if ($r.Score -ge 3) { $rowClass = "score-hi" }
+
+  $ownerText = if ($r.RemoteOwner) { Encode-Html $r.RemoteOwner } else { "" }
+  $netText   = if ($r.RemoteNet)   { Encode-Html $r.RemoteNet }   else { "" }
 
   [void]$rowsHtml.AppendLine(@"
-  <tr>
+  <tr class='$rowClass' data-new='$([int]$r.IsNew)' data-score='$($r.Score)'>
     <td>$($r.Protocol)</td>
-    <td><span class='badge'>$($r.State)</span></td>
-    $procCell
+    <td>$newBadge$stateBadge</td>
+    <td>$(Encode-Html $r.Process)</td>
     <td>$($r.PID)</td>
     <td>$(Encode-Html $r.Local)</td>
     <td>$(Encode-Html $r.Remote)</td>
-    <td>$(Encode-Html $ownerText)</td>
-    <td>$(Encode-Html $netText)</td>
+    <td>$ownerText</td>
+    <td>$netText</td>
+    <td>$($r.Score)</td>
     <td>$detailBlock</td>
   </tr>
 "@)
 }
 
-# Header subtext (precomputed to avoid inline-if surprises)
-$txtEstablished = "(no Established)"; if ($IncludeEstablished) { $txtEstablished = "Established" }
-$txtListening   = ""; if ($ShowListening) { $txtListening = " + Listening" }
-$txtLocal       = " + Public only"; if ($IncludeLocal) { $txtLocal = " + Local/LAN" }
-$txtRdns        = ""; if ($ResolveDNS) { $txtRdns = " + rDNS" }
-$txtRdap        = " + (RDAP off)"; if ($DoRDAP) { $txtRdap = " + RDAP" }
-
-$colProcessHeader = "Process"
-if ($ShowProcPath) { $colProcessHeader = "Process (Path)" }
-
 $themeLabel = "Dark"
-
 $html = @"
 <!DOCTYPE html>
 <html lang="en">
@@ -731,8 +820,7 @@ $scriptJs
 <body onload="postInit()">
   <h1>Netstat-Who Report</h1>
   <div class="sub">
-    Generated: $((Get-Date).ToString("yyyy-MM-dd HH:mm:ss")) &middot;
-    $txtEstablished$txtListening$txtLocal$txtRdns$txtRdap
+    Generated: $((Get-Date).ToString("yyyy-MM-dd HH:mm:ss")) &middot; $summaryFlags
   </div>
 
   <div class="controls">
@@ -741,6 +829,9 @@ $scriptJs
     <select id="procFilter" onchange="applyFilters()">
       $procOptions
     </select>
+    <label for="minScore">Min score:</label>
+    <input id="minScore" type="number" value="0" min="0" max="10" oninput="applyFilters()" style="width:72px" />
+    <label><input id="onlyNew" type="checkbox" onchange="applyFilters()"> Show only NEW</label>
     <button onclick="toCSV()">Export CSV</button>
     <button onclick="expandAllDetails()">Expand all details</button>
     <button onclick="collapseAllDetails()">Collapse all</button>
@@ -753,13 +844,14 @@ $scriptJs
         <tr>
             <th onclick="sortTable(0)">Proto <span class="sort-ind"></span></th>
             <th onclick="sortTable(1)">State <span class="sort-ind"></span></th>
-            <th onclick="sortTable(2)">$colProcessHeader <span class="sort-ind"></span></th>
+            <th onclick="sortTable(2)">Process <span class="sort-ind"></span></th>
             <th onclick="sortTable(3)">PID <span class="sort-ind"></span></th>
             <th onclick="sortTable(4)">Local <span class="sort-ind"></span></th>
             <th onclick="sortTable(5)">Remote <span class="sort-ind"></span></th>
             <th onclick="sortTable(6)">Owner <span class="sort-ind"></span></th>
             <th onclick="sortTable(7)">Net <span class="sort-ind"></span></th>
-            <th onclick="sortTable(8)">Remote IP &amp; Research <span class="sort-ind"></span></th>
+            <th onclick="sortTable(8)">Score <span class="sort-ind"></span></th>
+            <th onclick="sortTable(9)">Remote IP &amp; Research <span class="sort-ind"></span></th>
         </tr>
     </thead>
     <tbody>
@@ -768,7 +860,7 @@ $scriptJs
   </table>
 
   <footer>
-    Tip: use the Process dropdown for quick filtering, the search box for text filtering, click headers to sort, and “Expand all details” to open all IP panels.
+    Tips: use the Process dropdown for quick filtering, the search box for text filtering, set a minimum Suspicion Score, check “Show only NEW” to see deltas since your last run, click headers to sort, and “Expand all details” to open all IP panels.
   </footer>
 </body>
 </html>
@@ -784,6 +876,7 @@ try {
   Write-Warning "Failed to write HTML report: $($_.Exception.Message)"
 }
 
+# Save RDAP cache on exit
 if ($DoRDAP -and $UseCache) {
   try {
     if (-not (Test-Path $CacheDir)) { New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null }
